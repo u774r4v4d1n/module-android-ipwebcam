@@ -1,1 +1,1 @@
-from .android_ipwebcam import Android_IPWebCam
+from .android_ip_webcam import Android_IP_WebCam

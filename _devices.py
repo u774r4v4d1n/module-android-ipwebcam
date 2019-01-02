@@ -4,32 +4,55 @@ This file is used by the Yombo core to create a device object for the specific z
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks, CancelledError
 
+from yombo.constants.features import FEATURE_DURATION
+from yombo.constants.status_extra import STATUS_EXTRA_DURATION
 from yombo.core.exceptions import YomboWarning
-from yombo.lib.devices.camera import MjpegCamera, Image
-
 from yombo.core.log import get_logger
-
-logger = get_logger("modules.android_ipwebcam.device")
+from yombo.lib.devices.camera import VideoCamera, Image
+from yombo.utils.ffmpeg.sensor import SensorNoise, SensorMotion
 
 from . import const
 
+logger = get_logger("modules.android_ipwebcam.device")
 
-class Android_IPCam(MjpegCamera):
 
-    def _init_(self, **kwargs):
+class Android_IPWebCam(VideoCamera):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.SUB_PLATFORM = const.PLATFORM_ANDROID_IP_WEBCAM
         self.status_data = None
         self.sensor_data = None
         self._timeout = 5
         self._available = True
+        self._motion_sensor_device = None
+        self._motion_sensor_ffmpeg = None
+        self._noise_sensor_device = None
+        self._noise_sensor_ffmpeg = None
 
-    def _init_(self, **kwargs):
+        self._motion_enabled = None
+        self._motion_sensitivity = None
+        self._motion_reactivate_timeout = None
+        self._motion_low_timeout = None
+        self._motion_framerate = None
+        self._noise_enabled = None
+        self._noise_sensitivity = None
+        self._noise_reactivate_timeout = None
+        self._noise_low_timeout = None
+
+        reactor.callLater(0.05, self._reload_)  # Dont' hold up the system, spawn a child.
+
+    def _unload(self, **kwargs):
         """
-        Called by the Yombo framework to setup the device.
+        Closes the FFMPEG connections.
+
         :param kwargs:
         :return:
         """
-        reactor.callLater(1, self.reload)  # Dont' hold up the system, spawn a child.
+        if self._motion_sensor_ffmpeg is not None:
+            self._motion_sensor_ffmpeg.close()
+        if self._noise_sensor_ffmpeg is not None:
+            self._noise_sensor_ffmpeg.close()
 
     @inlineCallbacks
     def _reload_(self, **kwargs):
@@ -39,20 +62,151 @@ class Android_IPCam(MjpegCamera):
         :param kwargs:
         :return:
         """
+
+        yield self.device_variables()
+        # print(f"android vars: {self.device_variables_cached}")
+        try:
+            self._protocol = self.device_variables_cached["protocol"]["values"][0]
+        except KeyError:
+            self._protocol = "http"
         self._host = self.device_variables_cached["host"]["values"][0]
         self._port = self.device_variables_cached["port"]["values"][0]
-        self._auth = None
-
         username = self.device_variables_cached["username"]["values"][0]
         password = self.device_variables_cached["password"]["values"][0]
         if username and password:
-            self._auth = (username, password)
+            self._request_auth = (username, password)
+
+        try:
+            self._motion_enabled = self.device_variables_cached["motion_enabled"]["values"][0]
+        except KeyError:
+            self._motion_enabled = True
+        if self._motion_enabled is None:
+            self._motion_enabled = True
+        try:
+            self._motion_sensitivity = self.device_variables_cached["motion_sensitivity"]["values"][0]
+        except KeyError:
+            self._motion_sensitivity = 15
+        try:
+            self._motion_denoise = self.device_variables_cached["motion_denoise"]["values"][0]
+        except KeyError:
+            self._motion_denoise = 10
+        try:
+            self._motion_reactivate_timeout = self.device_variables_cached["motion_reactivate_timeout"]["values"][0]
+        except KeyError:
+            self._motion_reactivate_timeout = 10
+        try:
+            self._motion_low_timeout = self.device_variables_cached["motion_low_timeout"]["values"][0]
+        except KeyError:
+            self._motion_low_timeout = 10
+        try:
+            self._motion_framerate = self.device_variables_cached["motion_framerate"]["values"][0]
+        except KeyError:
+            self._motion_framerate = 8
+        try:
+            self._noise_enabled = self.device_variables_cached["noise_enabled"]["values"][0]
+        except KeyError:
+            self._noise_enabled = True
+        if self._noise_enabled is None:
+            self._noise_enabled = True
+        try:
+            self._noise_sensitivity = self.device_variables_cached["noise_sensitivity"]["values"][0]
+        except KeyError:
+            self._noise_sensitivity = -25
+        try:
+            self._noise_reactivate_timeout = self.device_variables_cached["noise_reactivate_timeout"]["values"][0]
+        except KeyError:
+            self._noise_reactivate_timeout = 30
+        try:
+            self._noise_low_timeout = self.device_variables_cached["noise_low_timeout"]["values"][0]
+        except KeyError:
+            self._noise_low_timeout = 30
+
+        # print("11111111: before update")
         yield self.update()
 
-    @property
-    def base_url(self):
-        """ Get the base URL for the android ip webcam endpoint."""
-        return f"http://{self._host}:{self._port}"
+        # print(f"11111111: self._motion_enabled: {self._motion_enabled}")
+
+        if self._motion_enabled is True:
+            # print("11111111: enabled")
+            if self._motion_sensor_device is None:
+                # print("11111111: no motion sensor device.")
+                self._motion_sensor_device = yield self._Devices.create_child_device(
+                    self,
+                    label="Motion",
+                    machine_label="motion",
+                    device_type="motion_sensor",
+                )
+            self._motion_sensor_device.FEATURES[FEATURE_DURATION] = True
+            self._motion_sensor_device.MACHINE_STATUS_EXTRA_FIELDS[STATUS_EXTRA_DURATION] = True
+            self._motion_sensor_device.set_status(machine_status=0)
+
+            if self._motion_sensor_ffmpeg is None:
+                self._motion_sensor_ffmpeg = SensorMotion(self, self.motion_sensor_callback,
+                                                          sensitivity=self._motion_sensitivity,
+                                                          denoise=self._motion_denoise,
+                                                          reactivate_timeout=self._motion_reactivate_timeout,
+                                                          low_timeout=self._motion_low_timeout,
+                                                          framerate=self._motion_framerate,
+                                                          connected_callback=self.motion_sensor_connected,
+                                                          closed_callback=self.motion_sensor_closed)
+            else:
+                self._motion_sensor_ffmpeg.close()
+            yield self._motion_sensor_ffmpeg.open_sensor(self.video_url, source_type="video")
+
+        if self._noise_enabled is True:
+            if self._noise_sensor_device is None:
+                self._noise_sensor_device = yield self._Devices.create_child_device(
+                    self,
+                    label="Noise",
+                    machine_label="noise",
+                    device_type="noise_sensor",
+                )
+            self._noise_sensor_device.FEATURES[FEATURE_DURATION] = True
+            self._noise_sensor_device.MACHINE_STATUS_EXTRA_FIELDS[STATUS_EXTRA_DURATION] = True
+            self._noise_sensor_device.set_status(machine_status=0)
+
+            if self._noise_sensor_ffmpeg is None:
+                self._noise_sensor_ffmpeg = SensorNoise(self, self.noise_sensor_callback, low_timeout=10,
+                                                        connected_callback=self.noise_sensor_connected,
+                                                        closed_callback=self.noise_sensor_closed)
+            else:
+                self._noise_sensor_ffmpeg.close()
+            yield self._noise_sensor_ffmpeg.open_sensor(self.audio_url)
+
+    def noise_sensor_connected(self, **kwargs):
+        print(f"noise_sensor_connected.")
+
+    def noise_sensor_closed(self, **kwargs):
+        print(f"noise_sensor_closed.")
+
+    def noise_sensor_callback(self, state, duration, trip_count):
+        """
+        Testing noise sensor
+        :param noise_state:
+        :param noise_duration:
+        :return:
+        """
+        # print(f"noise_sensor_callback: state: {state}, duration: {duration} seconds, trip_count: {trip_count}")
+        self._noise_sensor_device.set_status(machine_status=state,
+                                              machine_status_extra={FEATURE_DURATION: duration})
+
+    def motion_sensor_connected(self, **kwargs):
+        # print(f"motion_sensor_connected.")
+        pass
+
+    def motion_sensor_closed(self, **kwargs):
+        # print(f"motion_sensor_closed.")
+        pass
+
+    def motion_sensor_callback(self, state, duration, trip_count):
+        """
+        Testing noise sensor
+        :param motion_start:
+        :return:
+        """
+        # print(f"motion_sensor_callback: state: {state}, duration: {duration} seconds, trip_count: {trip_count}")
+        self._motion_sensor_device.set_status(machine_status=state,
+                                              machine_status_extra={FEATURE_DURATION: duration})
 
     @property
     def video_url(self):
@@ -63,6 +217,11 @@ class Android_IPCam(MjpegCamera):
     def image_url(self):
         """ Single image (snapshot) url."""
         return f"{self.base_url}/shot.jpg"
+
+    @property
+    def audio_url(self):
+        """ URL for the audio stream. """
+        return f"{self.base_url}/audio.wav"
 
     @property
     def available(self):
@@ -76,7 +235,7 @@ class Android_IPCam(MjpegCamera):
 
         :return:
         """
-        image_results = yield self._Requests.request("get", self.image_url, self._auth)
+        image_results = yield self._Requests.request("get", self.image_url, self.request_auth)
         return Image(content_type=image_results["headers"]["content-type"][0], iamge=image_results["content"])
 
     @inlineCallbacks
@@ -87,15 +246,14 @@ class Android_IPCam(MjpegCamera):
         url = f"{self.base_url}{path}"
         data = None
         if "auth" not in kwargs:
-            kwargs["auth"] = self._auth
+            kwargs["auth"] = self.request_auth
 
         try:
                 image_results = yield self._Requests.request("get", url, **kwargs)
                 response = image_results["response"]
-                if response.status == 200:
-                    data = image_results["content"]
-
-        except CancelledError as e:
+                # if response.status == 200:
+                data = image_results["content"]
+        except (CancelledError, YomboWarning) as e:
             logger.error(f"Error communicating with IP Webcam: {e}")
             self._available = False
             return
@@ -105,6 +263,31 @@ class Android_IPCam(MjpegCamera):
             return data.find("Ok") != -1
         else:
             return data
+
+    @property
+    def debug_data(self):
+        """
+        Provide additional debug data.
+
+        :return:
+        """
+        debug_data = super().debug_data
+        debug_data["android_ip_webcam"] = {
+            'title': _("module::android_ip_webcam::ui::debug_header", "Android IP Webcam device details"),
+            'description': _("module::android_ip_webcam::ui::debug_description", "Data as reported by the Android IP Webcam device."),
+            'fields': [
+                _("module::android_ip_webcam::ui::debug_column1", "Value name"),
+                _("module::android_ip_webcam::ui::debug_column2", "Value data")
+            ],
+            'data': {
+                _("module::android_ip_webcam::ui::debug::base_url", "Base URL"): self.base_url,
+                _("module::android_ip_webcam::ui::debug::video_url", "Video URL"): self.video_url,
+                _("module::android_ip_webcam::ui::debug::image_url", "Image URL"): self.image_url,
+                _("module::android_ip_webcam::ui::debug::audio_url", "Audio URL"): self.audio_url,
+                _("module::android_ip_webcam::ui::debug::last_image", "Last Image"): "not avail",
+            }
+        }
+        return debug_data
 
     @inlineCallbacks
     def update(self):
@@ -173,6 +356,7 @@ class Android_IPCam(MjpegCamera):
         for (key, val) in self.status_data.get("avail", {}).items():
             available[key] = []
             for subval in val:
+
                 try:
                     subval = float(subval)
                 except ValueError:
